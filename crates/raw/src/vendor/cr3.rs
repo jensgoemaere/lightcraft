@@ -237,7 +237,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     }
     metadata.width = Some(crop.width as u32);
     metadata.height = Some(crop.height as u32);
-    let image = RawImage {
+    let mut image = RawImage {
         format: RawFormat::Cr3,
         width,
         height,
@@ -258,6 +258,11 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         metadata,
         lens_metadata: Default::default(),
     };
+    // ColorData's white level is below where the sensor saturates (EOS RP 14558 under 16383): the samples between
+    // are real light, so the white level moves up to the data's saturation point (see `saturation.rs`)
+    if levels.white.is_some() && mode == Mode::Full {
+        image.extend_white_to_saturation();
+    }
     image.validate_for(mode)?;
     Ok(image)
 }

@@ -1,4 +1,4 @@
-//! Sensors that clip below the stated white level.
+//! Sensors that clip below, or above, the stated white level.
 //!
 //! A DNG's `WhiteLevel` is what the writer says the sample range tops out at, not always where the
 //! sensor really saturates: a camera app can state 4095 for 12-bit data that piles up at 3567 (85 % of
@@ -10,6 +10,14 @@
 //! (a pile-up of identical values near the top of the range) and raises the samples at or above it to
 //! the stated white level. Nothing else changes: unclipped samples keep their values, and a file whose
 //! data really reaches its white level, or has no pile-up, is left alone.
+//!
+//! The opposite also happens: Canon's CR3 `ColorData` white level sits below where the sensor saturates
+//! (EOS RP: 14558 while samples run linearly up to a pile-up at 16383; EOS R100 at ISO 640: 10439 under a
+//! pile-up spread over 13400–13700, about 0.4 EV). Samples between the two are real light, but highlight
+//! reconstruction took them as clipped and rebuilt them, which drew a hard-edged pale band where a bright
+//! sky crosses the stated level. [`RawImage::extend_white_to_saturation`] moves the white level up to the
+//! data's saturation point and adds the difference to the baseline exposure, so everything below the old
+//! white level renders exactly as before and only the highlights gain range.
 
 use crate::{RawData, RawImage};
 
@@ -26,6 +34,18 @@ const MAX_ABOVE: f64 = 0.02;
 const ABOVE_MARGIN: f32 = 0.01;
 /// How far below the plateau the "average value just below it" reaches.
 const NEIGHBOURHOOD: usize = 64;
+
+/// Above the stated white level the search runs on coarse bins of this share of the range above black: a plateau
+/// made by a digital ISO pull (Canon's −⅓-stop ISOs) is spread over a few hundred values, not one.
+const ABOVE_BIN: f32 = 1.0 / 128.0;
+/// Samples above the stated white level worth acting on: at least this share of all samples (and 64 of them).
+const ABOVE_SHARE: f64 = 1e-5;
+/// A saturation plateau above the stated white level is at least this many times as populated as the bins below
+/// it (`ABOVE_REFERENCE` of them, skipping the one right under the plateau, which a spread plateau spills into).
+const ABOVE_SPIKE: f64 = 3.0;
+const ABOVE_REFERENCE: usize = 8;
+/// Samples above the top of the data that are hot pixels, not where it ends.
+const ABOVE_STRAYS: u64 = 16;
 
 impl RawImage {
     /// The value each colour's samples saturate at, when that is clearly below the stated white level
@@ -103,6 +123,105 @@ impl RawImage {
             }
         }
         changed
+    }
+
+    /// Where the sensor saturates when its samples run past the stated white level (see the module docs): the
+    /// lowest lower edge of a colour's pile-up above that level, or the top of the bit depth when the data runs
+    /// past it without piling up anywhere (nothing saturated). `None` when next to nothing lies above the stated
+    /// white level, or the image isn't single-plane integer CFA data with sane levels.
+    pub fn saturation_above_white(&self) -> Option<f32> {
+        let (RawData::U16(d), Some(cfa)) = (&self.data, &self.cfa) else { return None };
+        let white = self.white_at(0);
+        let black = self.black.mean();
+        let full = ((1u32 << self.bits.clamp(1, 16)) - 1) as f32;
+        let levels_ok = black.is_finite() && white.is_finite() && black >= 0.0 && white > black && white < full;
+        if self.cpp != 1 || !cfa.valid() || self.width.checked_mul(self.height) != Some(d.len()) || !levels_ok {
+            return None;
+        }
+        let a = self.active_area;
+        let fits = |start: usize, len: usize, max: usize| start.checked_add(len).is_some_and(|end| end <= max);
+        if !fits(a.x, a.width, self.width) || !fits(a.y, a.height, self.height) || a.width == 0 {
+            return None;
+        }
+        // coarse bins over the upper half of the range, so the bins under a plateau just above the stated white
+        // level can still serve as its reference
+        let base = (black + 0.5 * (full - black)).min(white).floor().max(0.0) as usize;
+        let bin = ((ABOVE_BIN * (full - black)) as usize).max(1);
+        let top = full as usize;
+        let bins = (top - base.min(top)) / bin + 1;
+        let mut hist = vec![[0u64; 3]; bins];
+        let mut total = 0u64;
+        let mut above = 0u64;
+        // about 512 evenly spaced rows; the step is odd so both row parities, and with them every CFA site, are read
+        let step = (a.height / 512).max(1) | 1;
+        for y in (0..a.height).step_by(step) {
+            let Some(row) = d.get((a.y + y) * self.width + a.x..).and_then(|r| r.get(..a.width)) else { continue };
+            for (x, &v) in row.iter().enumerate() {
+                total += 1;
+                let v = usize::from(v);
+                if v as f32 > white {
+                    above += 1;
+                }
+                if v >= base
+                    && let Some(h) = hist.get_mut((v - base) / bin)
+                {
+                    h[cfa.color_at(a.x + x, a.y + y).min(2) as usize] += 1;
+                }
+            }
+        }
+        if (above as f64) < (total as f64 * ABOVE_SHARE).max(64.0) {
+            return None;
+        }
+        // the bin holding the stated white level: a pile-up can start in it (white level just under a spread plateau)
+        let first = (white as usize).saturating_sub(base) / bin;
+        let mut saturation: Option<f32> = None;
+        for c in 0..3 {
+            let count = |i: usize| hist.get(i).map_or(0, |h| h[c]);
+            // a pile-up is the top of the data (a few stray hot pixels above it aside), not its busiest bin: a bright
+            // sky just over the stated level can hold more samples than a small clipped patch
+            let mut strays = 0;
+            let Some(top) = (first..bins).rev().find(|&i| {
+                strays += count(i);
+                strays > ABOVE_STRAYS
+            }) else {
+                continue;
+            };
+            let Some(peak) = (top.saturating_sub(2).max(first)..=top).max_by_key(|&i| (count(i), i)) else { continue };
+            let n = count(peak);
+            let reference =
+                (peak.saturating_sub(1 + ABOVE_REFERENCE)..peak.saturating_sub(1)).map(count).sum::<u64>() as f64 / ABOVE_REFERENCE as f64;
+            let beyond: u64 = (peak + 3..bins).map(count).sum();
+            let is_plateau = n as f64 >= ABOVE_SPIKE * reference.max(1.0) && n >= 32 && beyond as f64 <= MAX_ABOVE * n as f64;
+            if !is_plateau {
+                continue;
+            }
+            // a spread plateau covers the bins under its peak that still stand out from the reference
+            let mut edge = peak;
+            while edge > first && count(edge - 1) as f64 >= ABOVE_SPIKE * reference.max(1.0) && count(edge - 1) * 2 >= n {
+                edge -= 1;
+            }
+            let level = ((base + edge * bin) as f32).clamp(white, full);
+            saturation = Some(saturation.map_or(level, |s| s.min(level)));
+        }
+        // past the stated white level with no pile-up anywhere: nothing saturated, keep the whole range (a pile-up
+        // at or just over the stated white level keeps it)
+        let level = saturation.unwrap_or(full);
+        (level > white + 1.0).then_some(level)
+    }
+
+    /// Raise the white level to [`Self::saturation_above_white`] and add the change to the baseline exposure, so
+    /// samples below the old white level render as before while the ones above it stay real light instead of
+    /// counting as clipped. Returns the new white level; the samples are not touched.
+    pub fn extend_white_to_saturation(&mut self) -> Option<f32> {
+        let level = self.saturation_above_white()?;
+        let black = self.black.mean();
+        let gain = (level - black) / (self.white_at(0) - black);
+        if !gain.is_finite() || gain <= 1.0 {
+            return None;
+        }
+        self.white = vec![level];
+        self.color.baseline_exposure += f64::from(gain).log2();
+        Some(level)
     }
 }
 
@@ -268,5 +387,111 @@ mod tests {
         assert!(r.lift_clipped_samples() > 1000);
         let after = render(&r);
         assert!(tint(after) < 0.01, "{after:?}");
+    }
+
+    /// A 14-bit 128 x 128 RGGB mosaic like a Canon CR3: black `black`, stated white `white`, samples spread
+    /// evenly from black up to `top`; `pile(i, v)` may replace each sample (a sensor's saturation).
+    fn canon(black: f32, white: f32, top: u32, pile: impl Fn(usize, u16) -> u16) -> RawImage {
+        let span = top - black as u32;
+        let data = (0..128 * 128usize)
+            .map(|i| {
+                let (x, y) = (i % 128, i / 128);
+                let v = (black as u32 + ((x * 131 + y * 37 + (x * y) % 97) as u32 * 7919) % span).min(65535) as u16;
+                pile(i, v)
+            })
+            .collect();
+        let mut r = raw_with(None, white);
+        r.width = 128;
+        r.height = 128;
+        r.data = RawData::U16(data);
+        r.bits = 14;
+        r.black = BlackLevel::uniform(black);
+        r.active_area = Rect::new(0, 0, 128, 128);
+        r.crop = Rect::new(0, 0, 128, 128);
+        r
+    }
+
+    #[test]
+    fn data_past_the_white_level_extends_it_to_the_pile_up() {
+        // EOS RP: ColorData says 14558, the sensor piles up at 16383 and is linear in between
+        let mut r = canon(512.0, 14558.0, 18000, |_, v| v.min(16383));
+        let before = r.data.clone();
+        let level = r.extend_white_to_saturation().expect("raised");
+        // the lower edge of the plateau's bin (1/128 of the range)
+        assert!((16383.0 - 125.0..=16383.0).contains(&level), "{level}");
+        assert_eq!(r.white, vec![level]);
+        let gain = ((level - 512.0) / (14558.0 - 512.0)) as f64;
+        assert!((r.color.baseline_exposure - gain.log2()).abs() < 1e-6, "{}", r.color.baseline_exposure);
+        assert_eq!(r.data, before, "samples untouched");
+        // a sample under the old white level normalises (with the baseline exposure) to what it did before
+        let v = 9000.0f32;
+        let old = (v - 512.0) / (14558.0 - 512.0);
+        let new = (v - 512.0) / (level - 512.0) * 2f32.powf(r.color.baseline_exposure as f32);
+        assert!((old - new).abs() < 1e-5, "{old} {new}");
+        assert_eq!(r.extend_white_to_saturation(), None, "idempotent");
+    }
+
+    #[test]
+    fn a_spread_pile_up_above_the_white_level_is_found() {
+        // EOS R100 at ISO 640 (a digitally pulled ISO): ColorData says 10439, the samples pile up over 13300..13700
+        let r = canon(2048.0, 10439.0, 16000, |i, v| if v >= 13300 { 13300 + ((i * 7919) % 400) as u16 } else { v });
+        let level = r.saturation_above_white().expect("found");
+        assert!((13100.0..=13400.0).contains(&level), "{level}");
+    }
+
+    #[test]
+    fn a_white_level_just_under_a_pile_up_is_kept() {
+        // the stated level sits inside the plateau's bin: the plateau is still a plateau, not unclipped light
+        // (taking the whole range would leave the saturated samples unflagged and turn them magenta)
+        let r = canon(2048.0, 13320.0, 16000, |i, v| if v >= 13300 { 13300 + ((i * 7919) % 400) as u16 } else { v });
+        // kept, or moved up at most to the plateau's lower bin edge, where its samples still count as clipped
+        let level = r.saturation_above_white().unwrap_or(13320.0);
+        assert!(level <= 2048.0 + (13300.0 - 2048.0) / 0.99, "{level}");
+    }
+
+    #[test]
+    fn a_small_pile_up_above_a_bright_sky_is_found() {
+        // most samples above the stated level are a sky just over it; the clipped patch at the top, where a pulled
+        // ISO saturates (16100, under the 14-bit range), is far smaller. (A sky within `ABOVE_REFERENCE` bins of
+        // the pile-up would hide it: the reference is a mean.)
+        let r = canon(512.0, 14558.0, 16300, |i, v| match i % 50 {
+            0 => 16100,
+            1..=25 if v > 12000 => 14600 + (v % 100),
+            _ => v.min(16100),
+        });
+        let level = r.saturation_above_white().expect("found");
+        assert!((16100.0 - 125.0..=16100.0).contains(&level), "{level}");
+    }
+
+    #[test]
+    fn data_past_the_white_level_without_a_pile_up_keeps_the_whole_range() {
+        // bright, unclipped light above the stated level: nothing saturated, so nothing counts as clipped
+        let r = canon(2048.0, 14558.0, 15800, |_, v| v);
+        assert_eq!(r.saturation_above_white(), Some(16383.0));
+    }
+
+    #[test]
+    fn data_under_the_white_level_is_left_alone() {
+        let mut r = canon(512.0, 14558.0, 14000, |_, v| v);
+        assert_eq!(r.extend_white_to_saturation(), None);
+        assert_eq!((r.white.clone(), r.color.baseline_exposure), (vec![14558.0], 0.0));
+        // a few hot pixels above it are not light worth a new white level
+        let mut r = canon(512.0, 14558.0, 14000, |i, v| if i % 1000 == 0 { 16383 } else { v });
+        assert_eq!(r.extend_white_to_saturation(), None);
+    }
+
+    #[test]
+    fn hostile_levels_keep_the_stated_white_level() {
+        for (black, white) in [(f32::NAN, 14558.0), (-5.0, 14558.0), (512.0, f32::NAN), (512.0, 16383.0), (512.0, 70000.0), (15000.0, 14558.0)] {
+            let mut r = canon(512.0, 14558.0, 18000, |_, v| v.min(16383));
+            r.black = BlackLevel::uniform(black);
+            r.white = vec![white];
+            assert_eq!(r.extend_white_to_saturation(), None, "{black} {white}");
+        }
+        let mut r = canon(512.0, 14558.0, 18000, |_, v| v.min(16383));
+        r.active_area = Rect::new(usize::MAX, 0, 2, 128);
+        assert_eq!(r.extend_white_to_saturation(), None);
+        r.active_area = Rect::new(0, 0, 0, 0);
+        assert_eq!(r.extend_white_to_saturation(), None);
     }
 }

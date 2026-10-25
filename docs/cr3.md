@@ -219,12 +219,36 @@ C-RAW captures; the pinned R7 file is lossless, so R7 C-RAW still has no black-b
 
 ## White level
 
-The white level is Canon's specular white from `ColorData` (the word after the
-normal white level), not the sensor's saturation point. On the RP at ISO 100
-it is 14558 while samples clip at 16383. At the −⅓-stop ISOs, which pull a
-higher analog ISO down digitally, it drops further: 11062 at ISO 5000, where
-red saturates near 13668. Samples above the white level render as clipped.
-Whether Lightroom recovers them has not been measured.
+`ColorData`'s white level (the word after the normal white level) is not the
+sensor's saturation point. On the EOS RP it is 14558 at every ISO while samples
+pile up at 16383, and in between the sensor is linear: on a night shot of the
+moon (ISO 3200) the G/R and G/B ratios of the same surfaces stay within 1% from
+G = 8000 up to 16300. The CC0 EOS R100 samples at ISO 640, a −⅓-stop ISO that
+pulls a higher analog ISO down digitally, state 10439 under a pile-up spread over
+13300–13700 (about 0.4 EV). Highlight reconstruction treated every sample above
+the stated level as clipped and rebuilt it, so where a bright sky crossed 14558
+it drew a hard-edged pale band (a ring around a backlit portrait).
+
+When samples run past the stated level (at least 1 in 100,000 of them, and 64),
+the decoder moves the white level up to the data's saturation point
+(`RawImage::extend_white_to_saturation`, `crates/raw/src/saturation.rs`): the
+lower edge of each colour's pile-up at the top of the data, searched on coarse
+bins of 1/128 of the range so a spread plateau counts, the lowest over the three
+colours; or the top of the bit depth when the data runs past the stated level
+without piling up anywhere (nothing saturated). The difference goes into the
+baseline exposure, so everything below the old white level renders exactly as
+before; only the highlights gain range. A file with nothing above the stated
+level is unchanged.
+
+Measured on 884 private EOS RP files (ISO 100–12800) and the 12 CC0 CR3 samples:
+509 RP files keep 14558, 338 move to 16319–16320 (the 16383 pile-up's bin), 41
+run past 14558 with nothing saturated and move to 16383; the R100 samples move to
+13322; the M50, R8 and R5 Mark II samples have nothing above their stated level
+and are unchanged. On 50 of the RP files spread over ISO, brightness, clipping
+and colour (k-means medoids), 48 render within 0.05 mean CIEDE2000 of before
+against the camera JPEG and the ring is gone. Limits: a busy patch of light within
+8 bins (about 6%) under a pile-up can hide it, and the level then becomes the top
+of the bit depth; whether Lightroom recovers the same range has not been measured.
 
 ## Colour limits
 
