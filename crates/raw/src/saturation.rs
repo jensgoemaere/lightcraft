@@ -129,6 +129,8 @@ impl RawImage {
         let bin = ((ABOVE_BIN * (full - black)) as usize).max(1);
         let bins = (full as usize - base) / bin + 1;
         let mut hist = vec![[0u64; 3]; bins];
+        // integer samples above `white` are those above its floor (`white` is finite, in 0..full)
+        let white_floor = white as usize;
         let mut total = 0u64;
         let mut above = 0u64;
         for y in (0..a.height).step_by(sample_row_step(a.height)) {
@@ -136,7 +138,7 @@ impl RawImage {
             for (x, &v) in row.iter().enumerate() {
                 total += 1;
                 let v = usize::from(v);
-                if v as f32 > white {
+                if v > white_floor {
                     above += 1;
                 }
                 if v >= base
@@ -389,15 +391,16 @@ mod tests {
                 pile(i, v)
             })
             .collect();
-        let mut r = raw_with(None, white);
-        r.width = 128;
-        r.height = 128;
-        r.data = RawData::U16(data);
-        r.bits = 14;
-        r.black = BlackLevel::uniform(black);
-        r.active_area = Rect::new(0, 0, 128, 128);
-        r.crop = Rect::new(0, 0, 128, 128);
-        r
+        RawImage {
+            width: 128,
+            height: 128,
+            data: RawData::U16(data),
+            bits: 14,
+            black: BlackLevel::uniform(black),
+            active_area: Rect::new(0, 0, 128, 128),
+            crop: Rect::new(0, 0, 128, 128),
+            ..raw_with(None, white)
+        }
     }
 
     /// EOS RP: ColorData says 14558, the sensor piles up at 16383 and is linear in between.

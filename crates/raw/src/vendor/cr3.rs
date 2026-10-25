@@ -258,8 +258,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         metadata,
         lens_metadata: Default::default(),
     };
-    // ColorData's white level is below where the sensor saturates (EOS RP 14558 under 16383): the samples between
-    // are real light, so the white level moves up to the data's saturation point (see `saturation.rs`)
+    // ColorData states a white level below the sensor's saturation point (see `saturation.rs`)
     if levels.white.is_some() && mode == Mode::Full {
         image.extend_white_to_saturation();
     }
