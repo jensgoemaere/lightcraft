@@ -733,6 +733,15 @@ pub struct Normalized {
     pub cfa: Option<Cfa>,
 }
 
+/// `color` as the file's headers state it: without the white extension a full decode adds
+/// ([`RawImage::extend_white_to_saturation`] needs the samples, which a header probe doesn't read), so a decode's
+/// [`RawInfo`] is its [`probe_info`]. Exact for CR3, whose decoder starts the baseline exposure at 0.
+fn stated_color(mut color: ColorData) -> ColorData {
+    color.baseline_exposure -= color.white_extension_ev;
+    color.white_extension_ev = 0.0;
+    color
+}
+
 impl RawImage {
     /// The description without the samples (what [`probe_info`] returns for the same file).
     pub fn info(&self) -> RawInfo {
@@ -746,7 +755,7 @@ impl RawImage {
             active_area: self.active_area,
             crop: self.crop,
             orientation: self.orientation,
-            color: self.color.clone(),
+            color: stated_color(self.color.clone()),
             wb_multipliers: self.wb_multipliers,
             opcodes: self.opcodes.clone(),
             metadata: self.metadata.clone(),
@@ -767,7 +776,7 @@ impl RawImage {
             active_area: self.active_area,
             crop: self.crop,
             orientation: self.orientation,
-            color: self.color,
+            color: stated_color(self.color),
             wb_multipliers: self.wb_multipliers,
             opcodes: self.opcodes,
             metadata: self.metadata,
