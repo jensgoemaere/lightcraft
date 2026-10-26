@@ -404,8 +404,7 @@ pub(crate) enum Mode {
     /// Headers and samples.
     Full,
     /// Headers only: the returned image has no samples, and black/white levels measured from
-    /// the samples are placeholders, as is `color.baseline_exposure` (a CR3 decode adds to it when it
-    /// raises the white level). Only [`RawImage::into_info`] may look at it.
+    /// the samples are placeholders. Only [`RawImage::into_info`] may look at it.
     Header,
 }
 

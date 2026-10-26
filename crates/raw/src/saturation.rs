@@ -159,7 +159,7 @@ impl RawImage {
             return None;
         }
         // the bin holding the stated white level: a pile-up can start in it (white level just under a spread plateau)
-        let first = (white as usize).saturating_sub(base) / bin;
+        let first = white_floor.saturating_sub(base) / bin;
         let pile_up = |c: usize| {
             let count = |i: usize| hist.get(i).map_or(0, |h| h[c]);
             // a pile-up is the top of the data (a few stray hot pixels above it aside), not its busiest bin: a bright
