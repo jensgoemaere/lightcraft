@@ -661,6 +661,11 @@ pub struct ColorData {
     pub as_shot_white_xy: Option<Xy>,
     /// EV to add for a "normal" rendering (`BaselineExposure` + `BaselineExposureOffset`).
     pub baseline_exposure: f64,
+    /// The part of `baseline_exposure` that comes from raising the white level above the one the file states
+    /// ([`RawImage::extend_white_to_saturation`], CR3): normalised samples at `2^-white_extension_ev` and up are what
+    /// the file calls clipped. 0 otherwise. Not a DNG tag.
+    #[serde(default)]
+    pub white_extension_ev: f64,
     /// `BaselineSharpness`: sharpening relative to a reference camera (`None`: the DNG default,
     /// 1). Read and written back by DNG export; rendering doesn't use it yet.
     #[serde(default)]

@@ -16,8 +16,9 @@
 //! pile-up spread over 13400–13700, about 0.4 EV). Samples between the two are real light, but highlight
 //! reconstruction took them as clipped and rebuilt them, which drew a hard-edged pale band where a bright
 //! sky crosses the stated level. [`RawImage::extend_white_to_saturation`] moves the white level up to the
-//! data's saturation point and adds the difference to the baseline exposure, so everything below the old
-//! white level renders exactly as before and only the highlights gain range.
+//! data's saturation point and adds the difference to the baseline exposure (recording it as
+//! [`crate::ColorData::white_extension_ev`], so the camera-look fit still leaves out what the file calls clipped):
+//! everything below the old white level renders exactly as before and only the highlights gain range.
 
 use crate::vendor::sample_row_step;
 use crate::{Cfa, RawData, RawImage};
@@ -116,9 +117,10 @@ impl RawImage {
     }
 
     /// Where the sensor saturates when its samples run past the stated white level (see the module docs): the
-    /// lowest lower edge of a colour's pile-up above that level, or the top of the bit depth when the data runs
-    /// past it without piling up anywhere (nothing saturated). `None` when next to nothing lies above the stated
-    /// white level, or the image isn't single-plane integer CFA data with sane levels.
+    /// lowest lower edge of a colour's pile-up above that level, or the top of the bit depth when no pile-up is
+    /// found but the data reaches that top. `None` when next to nothing lies above the stated white level, when
+    /// the data ends under the top without piling up (no measured saturation point), or when the image isn't
+    /// single-plane integer CFA data with sane levels.
     pub fn saturation_above_white(&self) -> Option<f32> {
         let full = ((1u32 << self.bits.clamp(1, 16)) - 1) as f32;
         let (d, cfa, black, white) = self.cfa_samples().filter(|&(.., white)| white < full)?;
@@ -131,8 +133,10 @@ impl RawImage {
         let mut hist = vec![[0u64; 3]; bins];
         // integer samples above `white` are those above its floor (`white` is finite, in 0..full)
         let white_floor = white as usize;
+        let full_value = full as usize;
         let mut total = 0u64;
         let mut above = 0u64;
+        let mut at_top = 0u64;
         for y in (0..a.height).step_by(sample_row_step(a.height)) {
             let Some(row) = d.get((a.y + y) * self.width + a.x..).and_then(|r| r.get(..a.width)) else { continue };
             for (x, &v) in row.iter().enumerate() {
@@ -140,6 +144,9 @@ impl RawImage {
                 let v = usize::from(v);
                 if v > white_floor {
                     above += 1;
+                }
+                if v >= full_value {
+                    at_top += 1;
                 }
                 if v >= base
                     && let Some(h) = hist.get_mut((v - base) / bin)
@@ -178,22 +185,29 @@ impl RawImage {
             }
             Some(((base + edge * bin) as f32).clamp(white, full))
         };
-        // past the stated white level with no pile-up anywhere: nothing saturated, keep the whole range (a pile-up
-        // at or just over the stated white level keeps it)
-        let level = (0..3).filter_map(pile_up).fold(full, f32::min);
+        // no pile-up found: data that reaches the top of the bit depth piles up there behind a busy patch of light
+        // the bins can't tell apart from it; data that ends under the top has no measured saturation point and keeps
+        // the stated level. A pile-up at or just over the stated level keeps it too.
+        let level = match (0..3).filter_map(pile_up).reduce(f32::min) {
+            Some(level) => level,
+            None if at_top > ABOVE_STRAYS => full,
+            None => return None,
+        };
         (level > white + 1.0).then_some(level)
     }
 
     /// Raise the white level to [`Self::saturation_above_white`] and add the change to the baseline exposure, so
     /// samples below the old white level render as before while the ones above it stay real light instead of
-    /// counting as clipped. Returns the new white level; the samples are not touched.
+    /// counting as clipped. The change is also kept as [`crate::ColorData::white_extension_ev`], for fits that must
+    /// still treat what the file called clipped as clipped. Returns the new white level; the samples are not touched.
     pub fn extend_white_to_saturation(&mut self) -> Option<f32> {
         let level = self.saturation_above_white()?;
         // finite and above 1: `saturation_above_white` checked the levels and returns one above the white level
         let black = self.black.mean();
-        let gain = (level - black) / (self.white_at(0) - black);
+        let ev = f64::from((level - black) / (self.white_at(0) - black)).log2();
         self.white = vec![level];
-        self.color.baseline_exposure += f64::from(gain).log2();
+        self.color.baseline_exposure += ev;
+        self.color.white_extension_ev += ev;
         Some(level)
     }
 
@@ -421,6 +435,7 @@ mod tests {
         // the lower edge of the plateau's bin (1/128 of the range)
         assert!((16383.0 - 125.0..=16383.0).contains(&level), "{level}");
         assert_eq!(r.white, vec![level]);
+        assert!(r.color.white_extension_ev > 0.0 && r.color.white_extension_ev == r.color.baseline_exposure, "{:?}", r.color);
         assert_eq!(r.data, before, "samples untouched");
         // a sample under the old white level normalises (with the baseline exposure) to what it did before
         let v = 9000.0f32;
@@ -462,9 +477,23 @@ mod tests {
     }
 
     #[test]
-    fn data_past_the_white_level_without_a_pile_up_keeps_the_whole_range() {
-        // bright, unclipped light above the stated level: nothing saturated, so nothing counts as clipped
-        let r = canon(2048.0, 14558.0, 15800, |_, v| v);
+    fn data_past_the_white_level_without_a_pile_up_keeps_the_stated_level() {
+        // light above the stated level that ends under the top of the bit depth without piling up: no measured
+        // saturation point, so the stated level stays (a 90D at ISO 100 tops out at 15047 over a stated 13036)
+        let mut r = canon(2048.0, 14558.0, 15800, |_, v| v);
+        assert_eq!(r.extend_white_to_saturation(), None);
+        assert_eq!(r.white, vec![14558.0]);
+    }
+
+    #[test]
+    fn data_reaching_the_top_takes_it_when_its_pile_up_is_hidden() {
+        // a third of the samples are a busy patch of light over the 8 bins under the top, which hides the pile-up at
+        // 16383 from the bin search; the data still reaches the top of the bit depth, so that is the saturation point
+        let r = canon(512.0, 14558.0, 16300, |i, v| match (i % 3, i % 40) {
+            (_, 0) => 16383,
+            (0, _) => 15400 + v % 980,
+            _ => v,
+        });
         assert_eq!(r.saturation_above_white(), Some(16383.0));
     }
 
