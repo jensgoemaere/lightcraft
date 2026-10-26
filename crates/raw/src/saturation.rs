@@ -13,7 +13,7 @@
 //!
 //! The opposite also happens: Canon's CR3 `ColorData` white level sits below where the sensor saturates
 //! (EOS RP: 14558 while samples run linearly up to a pile-up at 16383; EOS R100 at ISO 640: 10439 under a
-//! pile-up spread over 13400–13700, about 0.4 EV). Samples between the two are real light, but highlight
+//! pile-up spread over 13300–13700, about 0.4 EV). Samples between the two are real light, but highlight
 //! reconstruction took them as clipped and rebuilt them, which drew a hard-edged pale band where a bright
 //! sky crosses the stated level. [`RawImage::extend_white_to_saturation`] moves the white level up to the
 //! data's saturation point and adds the difference to the baseline exposure (recording it as
